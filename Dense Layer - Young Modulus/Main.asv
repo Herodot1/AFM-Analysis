@@ -1,0 +1,326 @@
+clear all;
+
+% Parameters:
+% Number of points from the force distance curve used (starting the count 
+% from maximal indentation)
+NumPoints = 600;
+% Order of the polynomial for offset correction:
+Order = 1;
+% Starting point for the offset correction (counting/direction as in 
+% NumPoints). Needs to be smaller than NumPoints.
+startOffset = 599;
+% Diameter of indenter (in µm):
+DiameterIndenter = 10;
+% Diameter Sample:
+DiameterSample = 10^15;
+% Young modulus of indenter in Pa:
+YoungIndenter = 10^15;
+% Fit range for the Hertz model: (in values of Force -> fitting of force x
+% nN to y nN
+FitRangeYoung = [0.3,1];
+% Poisson ratio of sample:
+my = 0.5;
+% Fit range for the tension model: (in values of Force -> fitting of force x
+% nN to y nN
+FitRangeTension = [0.1,0.2];
+% Curves to be excluded
+ManualCurveRemoval = [];
+% Size of the region scanned (in number of steps):
+xSteps              = 20;                    
+ySteps              = 20;  
+
+% get current path and add it to the search path of matlab for additional
+% .m -files
+mPath = mfilename('fullpath');
+Idx = max(strfind(mPath,filesep));
+mPath = mPath(1:Idx);
+addpath(mPath)
+  
+% Get data path:
+Startpath=mPath;
+FolderPath=uigetdir(Startpath, 'Chose the folder with the images');
+cd(FolderPath);   
+FolderList = dir();
+FolderList([FolderList.isdir]~=1) = [];
+for i = size(FolderList,1):-1:1
+    if strcmp('..',FolderList(i).name) || strcmp('.',FolderList(i).name) 
+        FolderList(i) = [];
+    end
+end
+% Go to the folder with the exported raw data:
+cd(FolderList(1).name);
+% load spring constant value:
+SpringConstant = dlmread('k.txt');
+a
+% Get all file names:
+FileList = dir();
+FileList([FileList.isdir]==1) = [];
+% Remove non .txt files and k.txt from the list:
+for i = size(FileList,1):-1:1
+    if ~strcmp('txt',FileList(i).name(end-2:end)) || strcmp('k.txt',FileList(i).name) 
+        FileList(i) = [];
+    end
+end
+
+% read in data files:
+% as files are named as numbers of type  1.txt,2.txt, etc, determine n for
+% reading. "-2" as k.txt and radius.txt are stored there as well.
+n = size(FileList,1);
+Data = cell(n,1);
+for i=1:n    
+    Data{i}=dlmread(FileList(i).name,'\t',1,0); 
+end
+
+% Curves to be kept:
+KeptCurves = 1:size(Data,1);
+
+% As the data might not have the same number of data points, crop it to
+% a uniform size, removing some parts of the top part of the curve, above
+% the sample. Afterwards, due a first offset correction
+LoopRange = 1:size(Data,1);
+LoopRange(ManualCurveRemoval) = [];
+KeptCurves(ManualCurveRemoval) = [];
+CroppedDataY = NaN(NumPoints,length(LoopRange));
+CroppedDataX = NaN(NumPoints,length(LoopRange)); 
+IdxOut = [];
+count = 0;
+
+
+% Remove curves due to manually entered constraints:
+for i = LoopRange
+    tmpX = Data{i}(:,1);
+    tmpY = Data{i}(:,3);
+    %Remove zeros:
+    Removal = find(tmpY == 0);
+    tmpX(Removal) = [];
+    tmpY(Removal) = [];
+    % corrected x:
+    tmpX = abs(tmpX-max(tmpX));
+    % adjust too high values (propably given in pm instead of nm:
+    if  max(tmpX)-min(tmpX)  > 100
+        tmpX = tmpX/1000;
+    end
+    if size(tmpY,1)>= size(CroppedDataY,1)
+        % Get break points in curve:
+        TF=ischange(tmpY(end-size(CroppedDataY,1)+1:end),'linear','MaxNumChanges',1); % Using ischange to find the "abrupt changes" in the graph
+        % old:
+        % TF=ischange(tmpY,'linear','MaxNumChanges',1); % Using ischange to find the "abrupt changes" in the graph
+        Idx = find(TF == 1) -10;
+        % offset correction:
+        % s = 5;
+        % [~,startOffset] = min(abs(tmpX - s))              
+        [tmpYCorrected] = OffsetCorrection(tmpX(end-size(CroppedDataY,1)+1:end),tmpY(end-size(CroppedDataY,1)+1:end),[size(CroppedDataY,1) - startOffset,Idx],Order);
+        % old: 
+        % [tmpYCorrected] = OffsetCorrection(tmpX,tmpY,[length(tmpY) - startOffset,Idx],Order);       
+        % adjust too high values (propably given in pN instead of nN:
+        if  max(tmpYCorrected)-min(tmpYCorrected)  > 100
+            tmpYCorrected = tmpYCorrected/1000;
+        end
+        % Crop data:
+        CroppedDataY(:,i) = tmpYCorrected(end-size(CroppedDataY,1)+1:end); 
+        CroppedDataX(:,i) = tmpX(end-size(CroppedDataY,1)+1:end);
+    else
+        % If too few points, store index for later removal:
+        count = count+1;
+        IdxOut(count) = i;
+    end
+end
+% Remove columns corresponding to curves with too low point number (lower
+% than NumPoints)
+CroppedDataY(:,IdxOut) = [];
+CroppedDataX(:,IdxOut) = [];
+KeptCurves(:,IdxOut) = [];
+
+% Denoise data by reconstructing a "noise free" curve using PCA:
+[Reconstructed] =  ReconstructCurve(CroppedDataY');
+Reconstructed = Reconstructed';
+% Calculate residuals of reconstructed and original curve:
+Residuals = sum(abs((CroppedDataY-Reconstructed')),1);
+% Find potential outliers, pointing to bad reconstructions, that might
+% imply poor curves:
+BadReconstructions =(Residuals> median(Residuals) + 3*mad(Residuals));
+CroppedDataY(:,BadReconstructions) = [];
+CroppedDataX(:,BadReconstructions) = [];
+KeptCurves(:,BadReconstructions) = [];
+% Repeat reconstruction step to improve reconstruction of remaining curves:
+[Reconstructed] =  ReconstructCurve(CroppedDataY');
+Reconstructed = Reconstructed';
+figure; plot(CroppedDataY)
+figure; plot(Reconstructed')
+
+% now use reconstructed curves to refine offset correction and get better
+% fit values for offset, Young modulus and cortex tension determination:
+% CortexThickness determination does currently not work particularily well,
+% as I use for the Youngs modulus the one determined from the larger force
+% spectrum. That is what I suppose at least. 
+CorrectedReconstructed = NaN(size(Reconstructed));
+% Allocate variables:
+MaxIndentation = NaN(size(Reconstructed,1),1);
+IndendationMaxFitForce = MaxIndentation;
+Young = MaxIndentation;
+RSquaredHertz = MaxIndentation;
+Tension = MaxIndentation;
+CortexThickness = MaxIndentation;
+RSquaredTension = MaxIndentation;
+RSquaredCortexThickness = MaxIndentation;
+tmpIdx = [];
+count = 0;
+for i = 1:size(Reconstructed,1)
+    % Current data set:
+    tmpY = Reconstructed(i,:);
+    % Range used for fitting:
+    TF=ischange(tmpY,'variance','MaxNumChanges',1); % Using ischange to find the "abrupt changes" in the graph
+    %endOffset = find(TF == 1) -150;
+    %[~,startOffset] = min(abs(CroppedDataX - s));
+    %startOffset = 1;
+    %endOffset = startOffset+400;
+    endOffset = find(TF == 1)-150;
+    [tmpYCorrected] = OffsetCorrection(CroppedDataX(:,i),tmpY,[length(tmpY) - startOffset,endOffset],Order);
+    CorrectedReconstructed(i,:) = tmpYCorrected;     
+    % Do Young modulus calculation:
+    % first get last point where force is below zero -> this is probably
+    % quite close to the contact point. Add 5 to be sure
+    ContactPoint = 1 + find(tmpYCorrected<0,1,'last') + 5;
+    if ContactPoint>=length(tmpYCorrected)-2
+        ContactPoint = length(tmpYCorrected)-25;
+        count = count+1;
+        tmpIdx(count) = i;
+    end
+    % Maximal Indentation:
+    MaxIndentation(i) = CroppedDataX(size(tmpYCorrected,2),i)-CroppedDataX(ContactPoint,i);   
+    
+    % Find fit range for given force interval:
+    [~,startFitHertz] = min(abs(FitRangeYoung(1)-tmpYCorrected));
+    [~,endFitHertz] = min(abs(FitRangeYoung(2)-tmpYCorrected)); 
+    % Indentation for maximal fit force:
+    IndendationMaxFitForce(i) = CroppedDataX(endFitHertz,i)-CroppedDataX(ContactPoint,i);
+    % Contact point in µm:
+    ContactPoint = CroppedDataX(ContactPoint,i);
+    % Hertz fit:
+    if abs(startFitHertz - endFitHertz) > 2 && startFitHertz < endFitHertz
+        [tmpYoung,tmpRSquared] = HertzModel(CroppedDataX(:,i),tmpYCorrected,ContactPoint,[startFitHertz,endFitHertz],DiameterSample,DiameterIndenter,my,YoungIndenter);
+        Young(i) = tmpYoung;
+        RSquaredHertz(i) = tmpRSquared;
+    else
+        count = count+1;
+        tmpIdx(count) = i;
+        Young(i) = NaN;
+        RSquaredHertz(i) = NaN;
+    end
+    % Find fit range for tension model:
+    [~,startFitTension] = min(abs(FitRangeTension(1)-tmpYCorrected));
+    [~,endFitTension] = min(abs(FitRangeTension(2)-tmpYCorrected));
+    FitRange = [startFitTension,endFitTension];
+    % Calculate tension and cortex thickness. cortex thickness is probably
+    % way too low:
+    if abs(diff(FitRange))>2 && FitRange(1)<FitRange(2)
+        [tmpTension,tmpCortexThickness,tmpRSquaredTension,tmpRSquaredCortexThickness] = ...
+            SurfaceTension(CroppedDataX(:,i),tmpYCorrected,ContactPoint,SpringConstant,Young(i),DiameterSample,FitRange);
+        Tension(i) = tmpTension;
+        CortexThickness(i) = tmpCortexThickness;
+        RSquaredTension(i) = tmpRSquaredTension;
+        RSquaredCortexThickness(i) = tmpRSquaredCortexThickness;
+    else
+        count = count+1;
+        tmpIdx(count) = i;
+        Tension(i) = NaN;
+        CortexThickness(i) = NaN;
+        RSquaredTension(i) = NaN;
+        RSquaredCortexThickness(i) = NaN;
+    end
+end
+% get unique values of bad curves:
+tmpIdx = unique(tmpIdx);
+Young(tmpIdx) = [];
+Tension(tmpIdx) = [];
+RSquaredTension(tmpIdx) = [];
+RSquaredHertz(tmpIdx) = [];
+IndendationMaxFitForce(tmpIdx) = [];
+KeptCurves(tmpIdx) = [];
+CroppedDataY(:,tmpIdx) = [];
+CroppedDataX(:,tmpIdx) = [];
+Reconstructed(tmpIdx,:) = [];
+CorrectedReconstructed(tmpIdx,:) = [];
+
+%figure; plot(CorrectedReconstructed')
+% check for linearity of regime for hertz fit:
+[Coefficient] = corrcoef(Young,abs(IndendationMaxFitForce).^(2/3))
+nanmean(Young)
+nanmean(Tension)
+
+
+% save data:
+folder = fullfile(strcat(FolderPath,'\Results')); 
+% Checks the existence of the folder with the name "Results". If it
+% does not exist it is created.
+if (exist(folder) == 0)
+    mkdir('Results');   
+end
+cd(folder)
+
+%Save also as .mat file
+save('Results.mat','Young','Tension','RSquaredTension','RSquaredHertz','IndendationMaxFitForce','KeptCurves');
+save('Parameters.mat','NumPoints','Order','startOffset','DiameterIndenter'...
+    ,'YoungIndenter','FitRangeYoung','my','FitRangeTension','DiameterSample',...
+    'ManualCurveRemoval','xSteps','ySteps')
+
+% Generate heat map of elastic modulus.
+% Reconstruct intial positions:
+NumCurves = 1:xSteps*ySteps;
+YoungMap = NaN(size(NumCurves));
+IndendationMap = YoungMap;
+YoungMap(KeptCurves) = Young;
+% basically works like a linear interpolation (but just
+YoungMap = smooth(YoungMap,2);
+IndendationMap(KeptCurves) = IndendationMaxFitForce;  
+YoungMap = reshape(YoungMap,ySteps, xSteps);
+IndendationMap = reshape(IndendationMap,ySteps, xSteps);
+% Interpolate YoungMap using linear interpolation:
+[Xq,Yq] = meshgrid(1:xSteps,1:ySteps);
+YoungMap = interp2(Xq,Yq,YoungMap,Xq,Yq);
+;
+% Flip axis to match actual scanning direction
+YoungMap = flip(YoungMap,1)';
+IndendationMap = flip(IndendationMap,1)';
+
+
+
+% Generate heat map of the young´s modulus
+
+
+figure('units','normalized','outerposition',[0 0 1 1]);
+%imshow(young,[0,0.9*max(young(:))],'InitialMagnification','fit')
+% LN229
+E_max = 2000;
+% U138
+E_max = 1500;
+imshow(imgaussfilt(YoungMap,'Filterdomain','spatial'),[0,E_max],'InitialMagnification','fit')
+hold on
+colormap(jet(256))
+cb = colorbar('FontSize',24);
+ylabel(cb,'Young Modulus in Pa','FontSize',24);
+%caxis([0,0.9*max(young(:))])
+caxis([0,E_max])
+saveas(gcf, sprintf('Young.png'));
+savefig(sprintf('Young.fig'))
+close all
+
+
+% to do: reconstruct heatmap of elasticities
+
+
+a
+
+figure; plot(CroppedDataY)
+figure; plot(Reconstructed')
+figure; plot(CorrectedReconstructed')
+
+BadReconstructions =find(Residuals> median(Residuals) + 3*mad(Residuals));
+% test some curve reconstructions:
+CurveNum = BadReconstructions;
+figure; %plot(Reconstructed(:,CurveNum))
+hold on
+plot(CroppedDataY(:,CurveNum))
+
+
+
